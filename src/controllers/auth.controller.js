@@ -1,133 +1,157 @@
+// src/controllers/auth.controller.js
+const User = require('../models/user'); // ✅ corregido: nombre en minúsculas
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const bcrypt = require('bcryptjs');
 
-const signToken = (user) =>
-  jwt.sign(
-    { uid: user._id, role: user.role, name: user.name },
-    process.env.JWT_SECRET,
+// 🔐 Generar token JWT
+function generateToken(user) {
+  return jwt.sign(
+    {
+      id: user._id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+    },
+    process.env.JWT_SECRET || 'default_secret',
     { expiresIn: '7d' }
   );
+}
 
+// 🧩 Registrar nuevo usuario (solo admin o coordinator)
 exports.register = async (req, res) => {
   try {
     const { name, email, password, role, coursesCanTeach } = req.body;
 
-    // Solo admin puede crear admin / coordinator desde API protegida (veremos el middleware luego)
-    // Permitir definir los cursos que el profesor puede impartir. Si coursesCanTeach
-    // no está presente, el esquema lo inicializa como un arreglo vacío.
-    const user = await User.create({ name, email, password, role, coursesCanTeach });
-    const token = signToken(user);
-    res.status(201).json({
-      ok: true,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role },
-      token
-    });
-  } catch (err) {
-    if (err.code === 11000) {
-      return res.status(409).json({ ok: false, msg: 'Email ya está en uso' });
+    // Validaciones básicas
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Nombre, correo y contraseña son requeridos' });
     }
-    res.status(500).json({ ok: false, msg: 'Error creando usuario', err: err.message });
+
+    // Verificar duplicado
+    const existing = await User.findOne({ email });
+    if (existing) {
+      return res.status(400).json({ message: 'El correo ya está registrado' });
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+
+    const user = await User.create({
+      name,
+      email,
+      password: hashed,
+      role: role || 'professor',
+      coursesCanTeach: Array.isArray(coursesCanTeach) ? coursesCanTeach : [],
+    });
+
+    res.status(201).json({
+      message: 'Usuario registrado correctamente',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        coursesCanTeach: user.coursesCanTeach,
+      },
+    });
+  } catch (error) {
+    console.error('Error en register:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
   }
 };
 
+// 🔑 Login de usuario
 exports.login = async (req, res) => {
   try {
-    // aceptar alias comunes del frontend
-    const rawEmail = req.body?.email ?? req.body?.username ?? req.body?.usuario ?? '';
-    const rawPassword = req.body?.password ?? '';
+    const { email, password } = req.body;
+    const user = await User.findOne({ email }).select('+password');
 
-    // normalizar
-    const email = String(rawEmail).trim().toLowerCase();
-    const password = String(rawPassword); // no trim aquí por si la pass tiene espacios intencionales
+    if (!user) return res.status(400).json({ message: 'Credenciales inválidas' });
 
-    if (!email || !password) {
-      return res.status(400).json({ ok: false, msg: 'Email y contraseña son requeridos' });
-    }
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ message: 'Credenciales inválidas' });
 
-    const User = require('../models/User');
-    const user = await User.findOne({ email, isActive: true });
-    if (!user) return res.status(400).json({ ok: false, msg: 'Credenciales inválidas' });
+    const token = generateToken(user);
 
-    const valid = await user.comparePassword(password);
-    if (!valid) return res.status(400).json({ ok: false, msg: 'Credenciales inválidas' });
-
-    const jwt = require('jsonwebtoken');
-    const token = jwt.sign(
-      { uid: user._id, role: user.role, name: user.name },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    return res.json({
-      ok: true,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role },
+    res.json({
+      message: 'Inicio de sesión exitoso',
       token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        coursesCanTeach: user.coursesCanTeach,
+      },
     });
-  } catch (err) {
-    console.error('LOGIN ERROR:', err);
-    return res.status(500).json({ ok: false, msg: 'Error en login' });
+  } catch (error) {
+    console.error('Error en login:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
   }
 };
 
+// 👤 Obtener perfil del usuario autenticado
 exports.me = async (req, res) => {
-  const user = await User.findById(req.uid).select('-password');
-  res.json({ ok: true, user });
+  try {
+    const user = await User.findById(req.user.id).populate('coursesCanTeach');
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' });
+    res.json(user);
+  } catch (error) {
+    console.error('Error en me:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
+  }
 };
 
+// 📋 Listar usuarios (opcionalmente por rol)
 exports.listUsers = async (req, res) => {
   try {
-    const { role } = req.query; // opcional: ?role=professor
-    const filter = {};
-    if (role) filter.role = role;
-    const users = await require('../models/User').find(filter).select('-password').sort({ name: 1 });
-    res.json({ ok: true, users });
-  } catch (e) {
-    res.status(500).json({ ok: false, msg: 'Error listando usuarios', err: e.message });
+    const { role } = req.query;
+    const filter = role ? { role } : {};
+    const users = await User.find(filter)
+      .populate('coursesCanTeach')
+      .select('-password');
+    res.json(users);
+  } catch (error) {
+    console.error('Error en listUsers:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
   }
 };
 
-/**
- * Actualiza los datos de un usuario existente. Solo pueden hacerlo los roles autorizados.
- * Permite modificar nombre, email, role, cursos que puede impartir y contraseña (opcional).
- */
+// ✏️ Actualizar usuario existente
 exports.updateUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, email, role, coursesCanTeach, password } = req.body;
-    const user = await require('../models/User').findById(id);
-    if (!user) {
-      return res.status(404).json({ ok: false, msg: 'Usuario no encontrado' });
+    const { name, email, password, role, coursesCanTeach } = req.body;
+
+    const dataToUpdate = { name, email, role };
+    if (password) {
+      dataToUpdate.password = await bcrypt.hash(password, 10);
     }
-    if (name !== undefined) user.name = name;
-    if (email !== undefined) user.email = email;
-    if (role !== undefined) user.role = role;
-    if (Array.isArray(coursesCanTeach)) user.coursesCanTeach = coursesCanTeach;
-    // Si se envía una contraseña nueva, actualizarla; el hook pre('save') la encriptará
-    if (password) user.password = password;
-    await user.save();
-    // No devolver la contraseña
-    const { password: _pw, ...plain } = user.toObject();
-    return res.json({ ok: true, user: plain });
-  } catch (err) {
-    console.error('UPDATE USER ERROR:', err);
-    return res.status(500).json({ ok: false, msg: 'Error actualizando usuario', err: err.message });
+    if (Array.isArray(coursesCanTeach)) {
+      dataToUpdate.coursesCanTeach = coursesCanTeach;
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(id, dataToUpdate, { new: true }).select('-password');
+    if (!updatedUser) return res.status(404).json({ message: 'Usuario no encontrado' });
+
+    res.json({
+      message: 'Usuario actualizado correctamente',
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error('Error en updateUser:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
   }
 };
 
-/**
- * Elimina (desactiva) un usuario existente. En lugar de borrar definitivamente, se marca como inactivo.
- */
+// 🗑️ Eliminar usuario (borrado físico)
 exports.deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
-    // Eliminación física del usuario. Si deseas una eliminación lógica, sustituye findByIdAndDelete por un flag.
-    const user = await require('../models/User').findByIdAndDelete(id);
-    if (!user) {
-      return res.status(404).json({ ok: false, msg: 'Usuario no encontrado' });
-    }
-    return res.json({ ok: true, msg: 'Usuario eliminado' });
-  } catch (err) {
-    console.error('DELETE USER ERROR:', err);
-    return res.status(500).json({ ok: false, msg: 'Error eliminando usuario', err: err.message });
+    const deleted = await User.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ message: 'Usuario no encontrado' });
+    res.json({ message: 'Usuario eliminado correctamente' });
+  } catch (error) {
+    console.error('Error en deleteUser:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
   }
 };
