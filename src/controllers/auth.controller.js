@@ -35,12 +35,29 @@ exports.register = async (req, res) => {
 
     const hashed = await bcrypt.hash(password, 10);
 
+    // Normalizamos el array de cursos. El front puede enviarlos como objetos
+    // completos ({ _id, name }) o como strings.  Nos aseguramos de extraer
+    // siempre el identificador para que Mongoose pueda castearlo a ObjectId.
+    const normalizeCourses = (arr) => {
+      if (!Array.isArray(arr)) return [];
+      return arr
+        .map((c) => {
+          if (!c) return null;
+          if (typeof c === 'string') return c;
+          if (typeof c === 'object') {
+            return c._id || c.value || c.id || null;
+          }
+          return null;
+        })
+        .filter(Boolean);
+    };
+
     const user = await User.create({
       name,
       email,
       password: hashed,
       role: role || 'professor',
-      coursesCanTeach: Array.isArray(coursesCanTeach) ? coursesCanTeach : [],
+      coursesCanTeach: normalizeCourses(coursesCanTeach),
     });
 
     res.status(201).json({
@@ -106,10 +123,23 @@ exports.listUsers = async (req, res) => {
   try {
     const { role } = req.query;
     const filter = role ? { role } : {};
-    const users = await User.find(filter)
-      .populate('coursesCanTeach')
-      .select('-password');
-    res.json(users);
+    // Obtenemos los usuarios sin popular los cursos para evitar devolver
+    // documentos completos de curso.  Lean convierte los documentos a
+    // objetos planos, lo que facilita mapear los ObjectId a strings.
+    const users = await User.find(filter).select('-password').lean();
+    // Normalizamos el arreglo coursesCanTeach a strings
+    const mapped = users.map((u) => {
+      const courses = Array.isArray(u.coursesCanTeach)
+        ? u.coursesCanTeach.map((c) => {
+            // si es objeto { _id: ObjectId }
+            if (typeof c === 'string') return c;
+            if (c && typeof c === 'object') return c.toString ? c.toString() : c._id?.toString?.();
+            return null;
+          }).filter(Boolean)
+        : [];
+      return { ...u, coursesCanTeach: courses };
+    });
+    res.json(mapped);
   } catch (error) {
     console.error('Error en listUsers:', error);
     res.status(500).json({ message: 'Error interno del servidor' });
@@ -127,7 +157,20 @@ exports.updateUser = async (req, res) => {
       dataToUpdate.password = await bcrypt.hash(password, 10);
     }
     if (Array.isArray(coursesCanTeach)) {
-      dataToUpdate.coursesCanTeach = coursesCanTeach;
+      // Normalizar el array de cursos de la misma manera que en register
+      const normalizeCourses = (arr) => {
+        return arr
+          .map((c) => {
+            if (!c) return null;
+            if (typeof c === 'string') return c;
+            if (typeof c === 'object') {
+              return c._id || c.value || c.id || null;
+            }
+            return null;
+          })
+          .filter(Boolean);
+      };
+      dataToUpdate.coursesCanTeach = normalizeCourses(coursesCanTeach);
     }
 
     const updatedUser = await User.findByIdAndUpdate(id, dataToUpdate, { new: true }).select('-password');
